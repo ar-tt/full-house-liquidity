@@ -1,0 +1,48 @@
+# SECURITY MASTER — what each ticker is. The Range Table can't judge a
+# trade in anything not listed here.
+#
+#   type        stock | etf | bond
+#   asset_class equity | bond | cash
+#   sector      one of range_table.sectors in config.yaml   (or sector_weights)
+#   region      US | Developed ex-US | Emerging             (or region_weights)
+#   issuer      the company behind it (default: name); two share classes of one company
+#               (e.g. GOOGL and GOOG) share an issuer so the 5% cap sees both
+#   has_prices  false for things with no daily price feed (e.g. STRIPS)
+#   cik         the SEC's company number (look it up at sec.gov/edgar); needed
+#               for the Convergence Engine to read the company's filings
+#
+# ETFs spread across several sectors or regions can use sector_weights /
+# region_weights (shares adding up to 1). Broad-market ETFs are marked
+# "Diversified" for now; see the note in the README about look-through.
+#
+# This is a STARTER universe for testing the rules, not a buy list.
+
+securities:
+  # --- US stocks ---
+  AAPL:  {name: Apple,               type: stock, asset_class: equity, sector: Information Technology, region: US, cik: 320193}
+  MSFT:  {name: Microsoft,           type: stock, asset_class: equity, sector: Information Technology, region: US, cik: 789019}
+  NVDA:  {name: NVIDIA,              type: stock, asset_class: equity, sector: Information Technology, region: US, cik: 1045810}
+  GOOGL: {name: Alphabet (Class A),  type: stock, asset_class: equity, sector: Communication Services, region: US, issuer: Alphabet, cik: 1652044}
+  GOOG:  {name: Alphabet (Class C),  type: stock, asset_class: equity, sector: Communication Services, region: US, issuer: Alphabet, cik: 1652044}
+  JPM:   {name: JPMorgan Chase,      type: stock, asset_class: equity, sector: Financials,             region: US, cik: 19617}
+  JNJ:   {name: Johnson & Johnson,   type: stock, asset_class: equity, sector: Health Care,            region: US, cik: 200406}
+  PG:    {name: Procter & Gamble,    type: stock, asset_class: equity, sector: Consumer Staples,       region: US, cik: 80424}
+  KO:    {name: Coca-Cola,           type: stock, asset_class: equity, sector: Consumer Staples,       region: US, cik: 21344}
+  XOM:   {name: Exxon Mobil,         type: stock, asset_class: equity, sector: Energy,                 region: US, cik: 34088}
+  HD:    {name: Home Depot,          type: stock, asset_class: equity, sector: Consumer Discretionary, region: US, cik: 354950}
+  CAT:   {name: Caterpillar,         type: stock, asset_class: equity, sector: Industrials,            region: US, cik: 18230}
+  NEE:   {name: NextEra Energy,      type: stock, asset_class: equity, sector: Utilities,              region: US, cik: 753308}
+  LIN:   {name: Linde,               type: stock, asset_class: equity, sector: Materials,              region: US, cik: 1707925}
+  AMT:   {name: American Tower,      type: stock, asset_class: equity, sector: Real Estate,            region: US, cik: 1053507}
+  # --- non-US stocks listed in the US (ADRs) ---
+  TSM:   {name: Taiwan Semiconductor, type: stock, asset_class: equity, sector: Information Technology, region: Emerging, cik: 1046179}
+  ASML:  {name: ASML,                 type: stock, asset_class: equity, sector: Information Technology, region: Developed ex-US, cik: 937966}
+  NVO:   {name: Novo Nordisk,         type: stock, asset_class: equity, sector: Health Care,            region: Developed ex-US, cik: 353278}
+  # --- ETFs ---
+  VTI:   {name: Vanguard Total US Stock Market,   type: etf, asset_class: equity, sector: Diversified, region: US,              issuer: Vanguard VTI}
+  VEA:   {name: Vanguard Developed Markets ex-US, type: etf, asset_class: equity, sector: Diversified, region: Developed ex-US, issuer: Vanguard VEA}
+  VWO:   {name: Vanguard Emerging Markets,        type: etf, asset_class: equity, sector: Diversified, region: Emerging,        issuer: Vanguard VWO}
+  XLK:   {name: Technology Select Sector SPDR,    type: etf, asset_class: equity, sector: Information Technology, region: US,   issuer: SPDR XLK}
+  GOVT:  {name: iShares US Treasury Bond,         type: etf, asset_class: bond,   sector: Government,  region: US,              issuer: iShares GOVT}
+  # --- individual Treasuries (the reserve ladder) ---
+  STRIP-2034: {name: US Treasury STRIPS Nov 2033, type: bond, asset_class: bond, sector: Government, region: US, issuer: US Treasury, has_prices: false}

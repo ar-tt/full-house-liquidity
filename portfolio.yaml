@@ -1,0 +1,25 @@
+# EXAMPLE PORTFOLIO — made up to exercise the Range Table rules
+# (roughly the size of Laura's account in 2028). Not a recommendation.
+# Values are current market values in dollars.
+holdings:
+  AAPL: 18000
+  MSFT: 18000
+  NVDA: 18000
+  GOOGL: 18000
+  JPM: 18000
+  JNJ: 18000
+  PG: 18000
+  KO: 18000
+  XOM: 18000
+  HD: 18000
+  CAT: 18000
+  NEE: 18000
+  LIN: 18000
+  AMT: 18000
+  TSM: 18000
+  ASML: 18000
+  NVO: 18000
+  VTI: 60000
+  VEA: 40000
+  GOVT: 30000
+cash: 35000

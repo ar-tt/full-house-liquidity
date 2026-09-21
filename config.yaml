@@ -1,0 +1,391 @@
+# Full House Capital — Full House Liquidity quant engine
+# Every number, date and switch the engine uses lives in this file.
+# Money is in US dollars. Rates are decimals (0.04 = 4%).
+
+meta:
+  team: Full House Capital
+  thesis: Full House Liquidity
+  client: Laura Gao
+  year_zero: 2026
+
+# ---------------------------------------------------------------------------
+# CASH-FLOW SCHEDULE — one row per movement of money.
+#   amount > 0  : money INTO the portfolio (Laura contributes)
+#   amount < 0  : money OUT of the portfolio (a residency payment)
+#   kind        : what the row is; the reserve funds every row whose kind is
+#                 listed in reserve.funds_kinds
+# Edit rows here; nothing in the code assumes how many there are.
+# ---------------------------------------------------------------------------
+cash_flows:
+  - {date: 2027-01-01, amount:  300000, kind: contribution,      note: "Initial investment"}
+  - {date: 2028-01-01, amount:  150000, kind: contribution,      note: "Second contribution"}
+  - {date: 2033-01-01, amount:  -50000, kind: residency_payment, note: "Residency payment 1 of 10"}
+  - {date: 2034-01-01, amount:  -50000, kind: residency_payment, note: "Residency payment 2 of 10"}
+  - {date: 2035-01-01, amount:  -50000, kind: residency_payment, note: "Residency payment 3 of 10"}
+  - {date: 2036-01-01, amount:  -50000, kind: residency_payment, note: "Residency payment 4 of 10"}
+  - {date: 2037-01-01, amount:  -50000, kind: residency_payment, note: "Residency payment 5 of 10"}
+  - {date: 2038-01-01, amount:  -50000, kind: residency_payment, note: "Residency payment 6 of 10"}
+  - {date: 2039-01-01, amount:  -50000, kind: residency_payment, note: "Residency payment 7 of 10"}
+  - {date: 2040-01-01, amount:  -50000, kind: residency_payment, note: "Residency payment 8 of 10"}
+  - {date: 2041-01-01, amount:  -50000, kind: residency_payment, note: "Residency payment 9 of 10"}
+  - {date: 2042-01-01, amount:  -50000, kind: residency_payment, note: "Residency payment 10 of 10"}
+
+# Dates on which a decision (not a fixed cash flow) happens.
+decision_dates:
+  cosponsor_quote: 2031-01-01        # Laura quotes co-sponsors a range
+  reserve_carve_out: 2033-01-01      # operating reserve set aside
+  facility_contribution: 2033-01-01  # facility gets what remains
+
+# ---------------------------------------------------------------------------
+# OPERATING RESERVE — a ladder of zero-coupon US Treasuries (STRIPS).
+# One "rung" per payment: a bond that pays exactly the payment amount on
+# (or just before) the payment date. Nominal, not TIPS, because payments
+# are fixed dollars.
+# ---------------------------------------------------------------------------
+reserve:
+  funds_kinds: [residency_payment]
+  # How to price the ladder on the carve-out date:
+  #   flat           : one interest rate for every rung (flat_rate below)
+  #   curve_spot     : assume the 2033 yield curve looks like the latest real one
+  #   curve_forward  : the 2033 cost implied by today's market (lockable today)
+  pricing: flat
+  flat_rate: 0.04
+  compounding: annual          # annual | semiannual | continuous (for flat rates)
+  scenario_rates: [0.03, 0.04, 0.05]
+  # Maturity buckets for "what is the reserve made of", in years to maturity.
+  maturity_buckets:
+    - {label: "Paid today (cash)", max_years: 0}
+    - {label: "Under 1 year",      max_years: 1}
+    - {label: "1-5 years",         max_years: 5}
+    - {label: "5-10 years",        max_years: 10}
+
+# ---------------------------------------------------------------------------
+# DETERMINISTIC PROJECTION — a single "what if returns are exactly X" path.
+# The Monte Carlo (step 5) replaces this with thousands of random paths,
+# using the same engine.
+# ---------------------------------------------------------------------------
+projection:
+  growth_rate: 0.07
+  scenario_growth_rates: [0.05, 0.07, 0.09]
+
+# ---------------------------------------------------------------------------
+# DATA SOURCES (free tier)
+# ---------------------------------------------------------------------------
+data:
+  cache_dir: data/cache
+  cache_max_age_days: 1
+  request_timeout_seconds: 60
+  treasury_curve:
+    # Federal Reserve Gürkaynak-Sack-Wright zero-coupon curve (free, daily).
+    url: https://www.federalreserve.gov/data/yield-curve-tables/feds200628.csv
+    filename: feds200628.csv
+
+# ===========================================================================
+# PILLARS — each one is a file in fhl/pillars/ plus one line here.
+# To add a fourth pillar (e.g. EDGE), write fhl/pillars/edge.py and add a line.
+#   structural: true  -> runs FIRST; if it blocks, the others never run
+#   enabled: false    -> skipped (the file doesn't have to exist yet)
+# ===========================================================================
+pillars:
+  - {name: range,       module: "fhl.pillars.range_table:RangeTable",         weight: 50, structural: true,  enabled: true}
+  - {name: convergence, module: "fhl.pillars.convergence:ConvergenceEngine",  weight: 25, structural: false, enabled: true}
+  - {name: position,    module: "fhl.pillars.position_clock:PositionClock",   weight: 25, structural: false, enabled: false}
+
+# How pillar scores become one number.
+#   geometric : scores MULTIPLY (weighted by `weight`), so a poor Range score
+#               drags everything down and can't be offset by a great stock
+#   gate_then_weighted : Range only blocks or passes; the other pillars are
+#               averaged by weight and the Range score is reported, not used
+#               (chosen by the team). If no scoring pillar has an opinion on a
+#               security (e.g. an ETF before the Position Clock exists), a
+#               trade that passed every rule goes ahead.
+combine:
+  method: gate_then_weighted
+  min_score_to_act: 60        # below this, a buy that passed every rule is still "hold off"
+
+# ===========================================================================
+# THE RANGE TABLE — portfolio structure rules
+# ===========================================================================
+securities_file: securities.yaml
+portfolio_file: portfolio.yaml
+
+range_table:
+  cap_base: total             # caps are shares of the whole portfolio incl. cash
+  asset_classes: [equity, bond, cash]
+  regions: [US, Developed ex-US, Emerging]
+  us_region: US
+  sectors: [Communication Services, Consumer Discretionary, Consumer Staples, Energy,
+            Financials, Health Care, Industrials, Information Technology, Materials,
+            Real Estate, Utilities, Government, Diversified]
+
+  # Hard caps (an order that breaks one is blocked)
+  single_name_cap: 0.05       # any one company
+  etf_cap: 0.25               # any one ETF (a fund holds hundreds of companies)
+  name_cap_exempt_issuers: [US Treasury]
+  sector_cap: 0.20
+  sector_cap_asset_classes: [equity]   # Treasuries are not a "sector bet"
+  sector_cap_exempt: [Diversified]     # broad-market ETFs; capped by etf_cap instead
+  non_us_cap: 0.25
+
+  # Budgets: [min, max] share of the portfolio. Max is a hard stop for buys;
+  # min only produces a warning. Step 4 (the wind-down) will set asset-class
+  # budgets year by year; these are the defaults until then.
+  asset_class_budgets:
+    equity: [0.00, 0.90]
+    bond:   [0.00, 1.00]
+    cash:   [0.00, 1.00]
+  region_budgets:
+    US:              [0.60, 1.00]
+    Developed ex-US: [0.00, 0.20]
+    Emerging:        [0.00, 0.10]
+
+  # Correlation (computed from daily closing prices, never downloaded ready-made)
+  correlation:
+    window_days: 60             # trading days of returns
+    max_avg_pairwise: 0.60      # block buys that push the average above this
+    good_avg_pairwise: 0.30     # at or below this, the correlation score is 100
+    averaging: weighted         # weighted (by position size) | equal
+    asset_classes: [equity]     # measured on the growth holdings only
+    missing_history: block      # block | warn when a buy lacks 60 days of prices
+
+  # Effective number of bets, from the correlation matrix eigenvalues
+  bets:
+    method: entropy             # entropy | participation
+    good: 15                    # at or above this, the bets score is 100
+    floor: 3                    # at or below this, the bets score is 0
+
+  positions:
+    count_asset_classes: [equity]
+    target: [25, 35]
+    hard_max: 35                # a buy of a NEW name above this is blocked
+    soft_band: 15               # score falls to 0 this many names outside the target
+
+  headroom:                     # how close the fullest cap is to its limit
+    full_score_below: 0.50      # using under half of every cap = 100
+    zero_score_at: 1.00         # sitting at a cap = 0
+
+  score_weights:                # how the Range score (0-100) is built
+    correlation: 0.35
+    bets: 0.35
+    headroom: 0.20
+    positions: 0.10
+
+prices:
+  source: yahoo_chart
+  url: "https://query1.finance.yahoo.com/v8/finance/chart/{ticker}?period1={start}&period2={end}&interval=1d&events=div%2Csplit"
+  history_start: 2010-01-01   # 10+ years for valuation ranges and dividend streaks
+  cache_subdir: prices
+
+# ===========================================================================
+# FUNDAMENTALS — raw numbers from company filings (SEC EDGAR, free)
+# Each metric lists alternatives. Per fiscal year, the first alternative whose
+# FIRST tag was filed wins; any other tags in it are added if present (e.g.
+# long-term debt + commercial paper). Companies switch tags over the years,
+# so this is checked year by year, never once per company.
+# ===========================================================================
+fundamentals:
+  edgar_url: "https://data.sec.gov/api/xbrl/companyfacts/CIK{cik:010d}.json"
+  # The SEC asks automated users to identify themselves with a contact email.
+  # Replace the text in brackets with your team's email address.
+  user_agent: "Full House Capital WGHSIC quant engine [add contact email]"
+  cache_subdir: edgar
+  cache_max_age_days: 7
+  seconds_between_requests: 0.2        # SEC limit is 10 requests/second
+  annual_forms: [10-K, 10-K/A, 20-F, 20-F/A, 40-F, 40-F/A]
+  annual_days: [350, 380]              # a fiscal year is 350-380 days long
+  year_end_tolerance_days: 10
+  # Missing = zero only where a missing tag really means "none" (no debt, no
+  # interest, no short-term investments). NOT dividends: some payers don't tag
+  # the amount, and "zero" would wrongly call them non-payers.
+  default_zero: [total_debt, interest_expense, short_term_investments]
+  latest_shares_max_age_days: 400      # share counts older than this are skipped for today's value
+  concepts:
+    revenue:
+      money: true
+      alternatives:
+        - [us-gaap:Revenues]
+        - [us-gaap:RevenueFromContractWithCustomerExcludingAssessedTax]
+        - [us-gaap:RevenueFromContractWithCustomerIncludingAssessedTax]
+        - [us-gaap:SalesRevenueNet]
+        - [us-gaap:SalesRevenueGoodsNet]
+        - [us-gaap:RegulatedAndUnregulatedOperatingRevenue]
+        - [ifrs-full:Revenue]
+    operating_income:
+      money: true
+      alternatives:
+        - [us-gaap:OperatingIncomeLoss]
+        - [ifrs-full:ProfitLossFromOperatingActivities]
+    pretax_income:
+      money: true
+      alternatives:
+        - [us-gaap:IncomeLossFromContinuingOperationsBeforeIncomeTaxesExtraordinaryItemsNoncontrollingInterest]
+        - [us-gaap:IncomeLossFromContinuingOperationsBeforeIncomeTaxesMinorityInterestAndIncomeLossFromEquityMethodInvestments]
+        - [us-gaap:IncomeLossFromContinuingOperationsBeforeIncomeTaxesDomestic, us-gaap:IncomeLossFromContinuingOperationsBeforeIncomeTaxesForeign]
+        - [ifrs-full:ProfitLossBeforeTax]
+    income_tax:
+      money: true
+      alternatives:
+        - [us-gaap:IncomeTaxExpenseBenefit]
+        - [ifrs-full:IncomeTaxExpenseContinuingOperations]
+    net_income:
+      money: true
+      alternatives:
+        - [us-gaap:NetIncomeLoss]
+        - [us-gaap:ProfitLoss]
+        - [ifrs-full:ProfitLossAttributableToOwnersOfParent]
+        - [ifrs-full:ProfitLoss]
+    eps_diluted:
+      per_share: true
+      alternatives:
+        - [us-gaap:EarningsPerShareDiluted]
+        - [ifrs-full:DilutedEarningsLossPerShare]
+    diluted_shares:
+      shares: true
+      alternatives:
+        - [us-gaap:WeightedAverageNumberOfDilutedSharesOutstanding]
+        - [ifrs-full:WeightedAverageNumberOfSharesOutstandingDiluted]
+        - [ifrs-full:AdjustedWeightedAverageShares]
+        - [us-gaap:WeightedAverageNumberOfSharesOutstandingBasic]   # when no diluted count is filed
+    operating_cash_flow:
+      money: true
+      alternatives:
+        - [us-gaap:NetCashProvidedByUsedInOperatingActivities]
+        - [us-gaap:NetCashProvidedByUsedInOperatingActivitiesContinuingOperations]
+        - [ifrs-full:CashFlowsFromUsedInOperatingActivities]
+    capex:
+      money: true
+      alternatives:
+        - [us-gaap:PaymentsToAcquirePropertyPlantAndEquipment]
+        - [us-gaap:PaymentsToAcquireProductiveAssets]
+        - [ifrs-full:PurchaseOfPropertyPlantAndEquipmentClassifiedAsInvestingActivities]
+    depreciation_amortization:
+      money: true
+      alternatives:
+        - [us-gaap:DepreciationDepletionAndAmortization]
+        - [us-gaap:DepreciationAmortizationAndAccretionNet]
+        - [us-gaap:DepreciationAndAmortization]
+        - [us-gaap:Depreciation, us-gaap:AmortizationOfIntangibleAssets]
+        - [ifrs-full:DepreciationAndAmortisationExpense]
+    dividends_paid:
+      money: true
+      alternatives:
+        - [us-gaap:PaymentsOfDividendsCommonStock]
+        - [us-gaap:PaymentsOfDividends]
+        - [us-gaap:PaymentsOfOrdinaryDividends]
+        - [ifrs-full:DividendsPaidClassifiedAsFinancingActivities]
+        - [ifrs-full:DividendsPaid]
+    interest_expense:
+      money: true
+      alternatives:
+        - [us-gaap:InterestExpense]
+        - [us-gaap:InterestExpenseNonoperating]
+        - [us-gaap:InterestExpenseDebt]
+        - [ifrs-full:InterestExpense]
+    total_assets:
+      money: true
+      instant: true
+      alternatives:
+        - [us-gaap:Assets]
+        - [ifrs-full:Assets]
+    equity:
+      money: true
+      instant: true
+      alternatives:
+        - [us-gaap:StockholdersEquity]
+        - [us-gaap:StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest]
+        - [ifrs-full:EquityAttributableToOwnersOfParent]
+        - [ifrs-full:Equity]
+    cash:
+      money: true
+      instant: true
+      alternatives:
+        - [us-gaap:CashAndCashEquivalentsAtCarryingValue]
+        - [us-gaap:CashCashEquivalentsRestrictedCashAndRestrictedCashEquivalents]
+        - [us-gaap:Cash]
+        - [ifrs-full:CashAndCashEquivalents]
+    short_term_investments:
+      money: true
+      instant: true
+      alternatives:
+        - [us-gaap:ShortTermInvestments]
+        - [us-gaap:MarketableSecuritiesCurrent]
+        - [us-gaap:AvailableForSaleSecuritiesDebtSecuritiesCurrent]
+        - [ifrs-full:CurrentInvestments]
+    total_debt:
+      money: true
+      instant: true
+      alternatives:
+        - [us-gaap:LongTermDebtAndCapitalLeaseObligationsIncludingCurrentMaturities, us-gaap:CommercialPaper, us-gaap:ShortTermBorrowings, us-gaap:OtherShortTermBorrowings]
+        - [us-gaap:LongTermDebtAndCapitalLeaseObligations, us-gaap:LongTermDebtAndCapitalLeaseObligationsCurrent, us-gaap:CommercialPaper, us-gaap:ShortTermBorrowings, us-gaap:OtherShortTermBorrowings]
+        - [us-gaap:LongTermDebt, us-gaap:CommercialPaper, us-gaap:ShortTermBorrowings, us-gaap:OtherShortTermBorrowings]
+        - [us-gaap:LongTermDebtNoncurrent, us-gaap:LongTermDebtCurrent, us-gaap:CommercialPaper, us-gaap:ShortTermBorrowings, us-gaap:OtherShortTermBorrowings]
+        - [us-gaap:DebtCurrent, us-gaap:LongTermDebtNoncurrent]
+        - [ifrs-full:Borrowings]
+        - [ifrs-full:NoncurrentPortionOfNoncurrentBorrowings, ifrs-full:CurrentBorrowingsAndCurrentPortionOfNoncurrentBorrowings]
+
+# ===========================================================================
+# THE CONVERGENCE ENGINE — is this a business where several return sources
+# (quality compounding, a durable dividend, a price below value) agree?
+# Each metric maps to 0-100 on a straight line from `worst` (0) to `best` (100).
+# ===========================================================================
+convergence:
+  applies_to_types: [stock]            # ETFs and bonds get "no opinion"
+  unsupported_sectors: [Financials]    # bank/insurer accounts don't fit ROIC/FCF/EBITDA
+  missing_data: block                  # block | no_opinion when a stock can't be scored
+  min_years: 5                         # fewer years of filings = can't score
+  history_years: 10                    # "full cycle" / "own 10-year range"
+  statutory_tax_rate: 0.21             # used when a year's tax rate can't be computed
+  roic_cap: 0.60                       # ROIC above this (or with negative capital) counts as this
+
+  wacc:
+    equity_risk_premium: 0.05
+    market_proxy: VTI                  # beta is measured against this
+    beta_years: 5                      # weekly returns
+    beta_shrink_to_one: 0.33           # 0.67 x measured beta + 0.33 x 1 (Blume adjustment)
+    beta_bounds: [0.5, 2.5]
+    risk_free_maturity_years: 10       # from the Fed Treasury curve on the as-of date
+    cost_of_debt_spread_bounds: [0.0, 0.06]   # interest/debt kept within rf + this range
+    floor: 0.06
+    risk_free_fallback: 0.04           # only if the Fed curve can't be loaded
+
+  dcf:
+    years: 10
+    terminal_growth: 0.025
+    growth_bounds: [0.0, 0.15]         # delivered growth used for intrinsic value
+    fcf_average_years: 3               # starting FCF = average of the last N years
+    reverse_search: [-0.20, 0.50]      # range searched for the price-implied growth
+
+  sources:                             # the three return sources and their weights
+    quality:  {weight: 0.40}
+    dividend: {weight: 0.20}
+    value:    {weight: 0.40}
+  non_payer_dividend: skip             # skip | zero (a company that pays no dividend)
+  min_metrics_per_source: 2
+  min_sources_scored: 2                # fewer than this = can't score the business
+  agree_threshold: 60                  # a source "points the way" at or above this
+  agreement_floor: 0.60                # final = average x (floor + (1-floor) x share agreeing)
+
+  metrics:
+    quality:
+      roic_spread:        {weight: 0.25, best: 0.10,  worst: -0.02}  # median ROIC - WACC
+      roic_consistency:   {weight: 0.15, best: 1.00,  worst: 0.50}   # share of years ROIC > WACC
+      fcf_margin:         {weight: 0.15, best: 0.20,  worst: 0.00}
+      revenue_growth:     {weight: 0.15, best: 0.10,  worst: 0.00}   # full-cycle, per year
+      eps_growth:         {weight: 0.10, best: 0.12,  worst: 0.00}
+      net_debt_to_ebitda: {weight: 0.10, best: 1.00,  worst: 3.00}
+      accrual_ratio:      {weight: 0.10, best: -0.05, worst: 0.10}
+    dividend:
+      growth_streak:      {weight: 0.40, best: 10,    worst: 0}      # years of rising dividends
+      payout_ratio:       {weight: 0.30, best: 0.40,  worst: 0.60}
+      fcf_coverage:       {weight: 0.30, best: 2.50,  worst: 1.50}
+    value:
+      reverse_dcf_gap:    {weight: 0.30, best: 0.05,  worst: -0.05}  # delivered - implied growth
+      margin_of_safety:   {weight: 0.30, best: 0.40,  worst: 0.00}
+      fcf_yield_vs_own:   {weight: 0.15, best: 1.00,  worst: 0.00}   # 1 = cheapest in 10 years
+      ev_ebit_vs_own:     {weight: 0.15, best: 0.00,  worst: 1.00}   # 0 = cheapest in 10 years
+      ev_ebit_vs_sector:  {weight: 0.10, best: 0.70,  worst: 1.30}   # own / sector median
+
+  hard_rules:
+    min_margin_of_safety: 0.25         # buys below this are blocked
+    margin_of_safety_unknown: block    # block | warn when it can't be measured
+    max_net_debt_to_ebitda: null       # set a number to make leverage a hard stop too

@@ -27,16 +27,32 @@ class Proposal:
 
 
 @dataclass
+class Entry:
+    """A position being built in tranches (the Position Clock's memory)."""
+    started: date
+    tranches_done: int
+    full_size: float          # dollars, fixed when the entry started
+
+
+@dataclass
 class Portfolio:
     holdings: dict = field(default_factory=dict)   # ticker -> market value ($)
     cash: float = 0.0
+    entries: dict = field(default_factory=dict)    # ticker -> Entry, for positions still being built
+    contributions_through: date | None = None      # Laura's contributions up to this date are included
 
     @classmethod
     def from_file(cls, path: str | Path) -> "Portfolio":
         with open(path) as f:
             raw = yaml.safe_load(f) or {}
         h = {str(k).upper(): float(v) for k, v in (raw.get("holdings") or {}).items()}
-        return cls(h, float(raw.get("cash", 0)))
+        entries = {}
+        for t, e in (raw.get("entries") or {}).items():
+            for key in ("started", "tranches_done", "full_size"):
+                if key not in e:
+                    raise ConfigError(f"entries.{t} in {path} is missing '{key}'")
+            entries[str(t).upper()] = Entry(e["started"], int(e["tranches_done"]), float(e["full_size"]))
+        return cls(h, float(raw.get("cash", 0)), entries, raw.get("contributions_through"))
 
     @property
     def total(self) -> float:
@@ -60,7 +76,7 @@ class Portfolio:
             else:
                 h[p.ticker] = left
             cash = self.cash + p.amount
-        return Portfolio(h, cash)
+        return Portfolio(h, cash, dict(self.entries), self.contributions_through)
 
     def tickers(self, securities: dict, asset_classes: list | None = None) -> list[str]:
         out = []

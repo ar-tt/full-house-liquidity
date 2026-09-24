@@ -176,3 +176,31 @@ def test_beta_with_blume_adjustment():
     assert M.beta(s, m, 0.33, (0.5, 2.5)) == pytest.approx(0.67 * 1.5 + 0.33)
     assert M.beta(s, m, 0.0, (0.5, 1.2)) == 1.2
     assert M.beta({k: v for k, v in list(s.items())[:50]}, m, 0.33, (0.5, 2.5)) is None
+
+
+# --- growth fade -------------------------------------------------------------------
+
+def test_growth_path_steps_down_evenly():
+    assert M.growth_path(0.10, 2, 0.02, fade_years=3) == pytest.approx([0.10, 0.10, 0.08, 0.06, 0.04])
+    assert M.growth_path(0.10, 2, 0.02) == [0.10, 0.10]
+
+
+def test_fade_by_hand():
+    # year 1 grows 10% -> 110; year 2 (fade) grows 5% -> 115.5; then 0% forever at 10%
+    expected = 110 / 1.1 + 115.5 / 1.1 ** 2 + (115.5 / 0.10) / 1.1 ** 2
+    assert M.dcf_value(100, 0.10, 0.10, 1, 0.0, fade_years=1) == pytest.approx(expected)
+
+
+def test_fade_changes_nothing_when_growth_already_equals_terminal():
+    assert M.dcf_value(100, 0.03, 0.09, 10, 0.03, fade_years=10) == pytest.approx(M.dcf_value(100, 0.03, 0.09, 10, 0.03))
+
+
+def test_longer_fade_helps_fast_growers_and_hurts_slow_ones():
+    fast = [M.dcf_value(100, 0.12, 0.09, 10, 0.025, f) for f in (0, 5, 10)]
+    slow = [M.dcf_value(100, 0.01, 0.09, 10, 0.025, f) for f in (0, 5, 10)]
+    assert fast == sorted(fast) and slow == sorted(slow, reverse=True)
+
+
+def test_reverse_dcf_round_trip_with_fade():
+    ev = M.dcf_value(100, 0.11, 0.09, 10, 0.025, fade_years=10)
+    assert M.implied_growth(ev, 100, 0.09, 10, 0.025, -0.2, 0.5, fade_years=10) == pytest.approx(0.11, abs=1e-6)

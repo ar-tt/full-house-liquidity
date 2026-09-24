@@ -89,7 +89,7 @@ data:
 pillars:
   - {name: range,       module: "fhl.pillars.range_table:RangeTable",         weight: 50, structural: true,  enabled: true}
   - {name: convergence, module: "fhl.pillars.convergence:ConvergenceEngine",  weight: 25, structural: false, enabled: true}
-  - {name: position,    module: "fhl.pillars.position_clock:PositionClock",   weight: 25, structural: false, enabled: false}
+  - {name: position,    module: "fhl.pillars.position_clock:PositionClock",   weight: 25, structural: false, enabled: true}
 
 # How pillar scores become one number.
 #   geometric : scores MULTIPLY (weighted by `weight`), so a poor Range score
@@ -128,8 +128,9 @@ range_table:
   non_us_cap: 0.25
 
   # Budgets: [min, max] share of the portfolio. Max is a hard stop for buys;
-  # min only produces a warning. Step 4 (the wind-down) will set asset-class
-  # budgets year by year; these are the defaults until then.
+  # min only produces a warning. With equity_max_from_wind_down on, the
+  # growth asset classes' max is replaced by the wind-down ceiling for the date.
+  equity_max_from_wind_down: true
   asset_class_budgets:
     equity: [0.00, 0.90]
     bond:   [0.00, 1.00]
@@ -186,8 +187,11 @@ prices:
 fundamentals:
   edgar_url: "https://data.sec.gov/api/xbrl/companyfacts/CIK{cik:010d}.json"
   # The SEC asks automated users to identify themselves with a contact email.
-  # Replace the text in brackets with your team's email address.
-  user_agent: "Full House Capital WGHSIC quant engine [add contact email]"
+  # Put yours in config.local.yaml (kept out of git), not here:
+  #   fundamentals:
+  #     user_agent: "Full House Capital WGHSIC quant engine you@example.com"
+  # Without it, sec.gov refuses some requests (the company ticker list).
+  user_agent: "Full House Capital WGHSIC quant engine [add contact email in config.local.yaml]"
   cache_subdir: edgar
   cache_max_age_days: 7
   seconds_between_requests: 0.2        # SEC limit is 10 requests/second
@@ -333,6 +337,7 @@ convergence:
   unsupported_sectors: [Financials]    # bank/insurer accounts don't fit ROIC/FCF/EBITDA
   missing_data: block                  # block | no_opinion when a stock can't be scored
   min_years: 5                         # fewer years of filings = can't score
+  max_report_age_days: 550             # latest annual report older than this = can't score (stale)
   history_years: 10                    # "full cycle" / "own 10-year range"
   statutory_tax_rate: 0.21             # used when a year's tax rate can't be computed
   roic_cap: 0.60                       # ROIC above this (or with negative capital) counts as this
@@ -349,11 +354,35 @@ convergence:
     risk_free_fallback: 0.04           # only if the Fed curve can't be loaded
 
   dcf:
-    years: 10
-    terminal_growth: 0.025
-    growth_bounds: [0.0, 0.15]         # delivered growth used for intrinsic value
-    fcf_average_years: 3               # starting FCF = average of the last N years
+    years: 10                          # years at the growth rate the business has delivered
+    fade_years: 10                     # then growth steps down evenly to terminal over this many years (3C)
+    terminal_growth: 0.025             # growth forever after that
+    growth_bounds: [0.0, 0.15]         # delivered growth is kept inside this range
+    fcf_start: average                 # starting FCF: average (of fcf_average_years) | latest
+    fcf_average_years: 3
     reverse_search: [-0.20, 0.50]      # range searched for the price-implied growth
+
+  # What the 25% margin-of-safety rule is measured against.
+  valuation:
+    margin_of_safety_basis: blended    # dcf | blended (3C: blend using the fade-10 DCF)
+    blend_weights:                     # for "blended"; re-weighted over the methods available
+      dcf: 0.50                        # the DCF above
+      own_ev_ebit: 0.20                # value if EV/EBIT went back to its own 10-yr median
+      own_fcf_yield: 0.10              # value if FCF yield went back to its own 10-yr median
+      sector_ev_ebit: 0.20             # value at the sector's median EV/EBIT
+    blend_min_methods: 2               # fewer methods than this = no blended value
+
+  # What-ifs for `python -m fhl value-compare`. Each sets settings under
+  # `convergence` (dotted names), spelled out in full so a version means the
+  # same thing whatever the live default is. Nothing here changes a decision.
+  valuation_variants:
+    - {code: A,  name: "DCF: 10 yrs growth, then 2.5%",          changes: {valuation.margin_of_safety_basis: dcf, dcf.fade_years: 0}}
+    - {code: B,  name: "DCF, fade over 5 yrs",                    changes: {valuation.margin_of_safety_basis: dcf, dcf.fade_years: 5}}
+    - {code: C,  name: "DCF, fade over 10 yrs",                   changes: {valuation.margin_of_safety_basis: dcf, dcf.fade_years: 10}}
+    - {code: D,  name: "DCF, fade 10 yrs, latest-year FCF",       changes: {valuation.margin_of_safety_basis: dcf, dcf.fade_years: 10, dcf.fcf_start: latest}}
+    - {code: E,  name: "DCF, fade 10 yrs, growth cap 20%",        changes: {valuation.margin_of_safety_basis: dcf, dcf.fade_years: 10, dcf.growth_bounds: [0.0, 0.20]}}
+    - {code: "3",  name: "Blend with the no-fade DCF",            changes: {valuation.margin_of_safety_basis: blended, dcf.fade_years: 0}}
+    - {code: "3C", name: "Blend with the fade-10 DCF (DEFAULT)",  changes: {valuation.margin_of_safety_basis: blended, dcf.fade_years: 10}}
 
   sources:                             # the three return sources and their weights
     quality:  {weight: 0.40}
@@ -389,3 +418,236 @@ convergence:
     min_margin_of_safety: 0.25         # buys below this are blocked
     margin_of_safety_unknown: block    # block | warn when it can't be measured
     max_net_debt_to_ebitda: null       # set a number to make leverage a hard stop too
+
+# ===========================================================================
+# THE POSITION CLOCK — WHEN to buy, never WHAT (that is Range + Convergence)
+# ===========================================================================
+
+# LONG HAND: the wind-down from growth assets to the Treasury reserve.
+wind_down:
+  growth_asset_classes: [equity]
+  # Calendar, one row per step. From each date on, the growth share must stay
+  # inside [low, high]. HIGH IS A HARD CEILING: the Range Table blocks any buy
+  # above it. Funded status (below) decides where inside the band to sit, and
+  # can go BELOW the band to protect the reserve; it can never go above it.
+  schedule:
+    - {from: 2026-01-01, growth: [0.85, 0.90]}
+    - {from: 2030-01-01, growth: [0.70, 0.80]}
+    - {from: 2032-01-01, growth: [0.50, 0.60]}
+    - {from: 2033-01-01, growth: [0.00, 0.00]}   # reserve carved out; the rest goes to the facility
+  # Projected funded status = portfolio value projected to the carve-out date
+  # (following the calendar, at the expected returns below, plus promised
+  # contributions) / what the reserve is projected to cost on that date.
+  expected_return_growth: 0.07
+  expected_return_safe: 0.045
+  funded_status:
+    behind_below: 1.30         # at or below: stay at the ceiling ("more time in equities, never leverage")
+    lock_in_above: 1.90        # at or above: lock the whole reserve in Treasuries now
+  # Share of the reserve's lock-in cost (what the remaining payments cost in
+  # Treasuries today) that must ALREADY be in Treasuries from each date, so no
+  # growth asset has to be sold in a drawdown at the carve-out. Waived when
+  # even an all-Treasury portfolio couldn't cover it (that would lock in a shortfall).
+  # FULL RAMP (team decision after step 5): the whole reserve is in Treasuries
+  # by 2032, so the carve-out never needs a stock sale. The softened ramp
+  # (25/45/75%) secured the payments on only 70% of simulated paths.
+  hedge_ramp:
+    - {from: 2030-01-01, share: 0.33}
+    - {from: 2031-01-01, share: 0.67}
+    - {from: 2032-01-01, share: 1.00}
+  # Risk dial: the growth share actually held = the target from the rules
+  # above x this. 0.75 = the most facility money that still clears the 95%
+  # certainty test in step 5 (98.4% of paths). It can take growth below the
+  # calendar band; it never raises it above the ceiling.
+  risk_dial: 0.75
+  rebalance_tolerance: 0.02    # within +/- 2 points of target counts as on target
+
+# SHORT HAND: timing and size of each entry into a position.
+position_clock:
+  applies_to_types: [stock, etf]    # bonds follow the ladder, not the clock
+  indicators:
+    trend_ma_days: 200
+    adx_days: 14
+    adx_trending_above: 20
+    rsi_days: 14
+    rsi_accelerate_below: 40
+    rsi_delay_above: 70
+    vol_days: 60
+  # The regime sets the pace: 3 tranches spaced this many weeks apart
+  # (2 weeks = in over 4 weeks, 4 weeks = in over 8 weeks), and a timing score.
+  regimes:
+    uptrend:   {spacing_weeks: 2, score: 80}   # price above its 200-day average and ADX > 20
+    no_trend:  {spacing_weeks: 3, score: 65}   # ADX at or below 20
+    downtrend: {spacing_weeks: 4, score: 45}   # price below its 200-day average and ADX > 20
+  tranches: 3
+  max_window_weeks: 8          # every tranche is in by then, whatever RSI says
+  accelerate_weeks: 1          # RSI under 40 pulls the next tranche forward this much
+  rsi_score_adjust: {accelerate: 15, delay: -25}
+  # Full position size = base_weight x (reference_vol / the stock's 60-day
+  # volatility), kept inside weight_bounds; shares of the whole portfolio.
+  sizing:
+    stock: {base_weight: 0.035, reference_vol: 0.25, weight_bounds: [0.01, 0.05]}
+    etf:   {base_weight: 0.15,  reference_vol: 0.16, weight_bounds: [0.02, 0.25]}
+  size_tolerance: 0.10         # an order up to 10% above the tranche size is fine
+
+# ===========================================================================
+# RISK CONTROLS — hard limits. The simulation below obeys them month by month.
+# ===========================================================================
+risk_controls:
+  # The portfolio's volatility (growth share x growth-asset volatility) may
+  # not exceed this: 12% through 2029, stepping down to 8% by 2032.
+  vol_target:
+    - {from: 2026-01-01, vol: 0.12}
+    - {from: 2030-01-01, vol: 0.1067}
+    - {from: 2031-01-01, vol: 0.0933}
+    - {from: 2032-01-01, vol: 0.08}
+  vol_lookback_months: 12      # growth-asset volatility measured over the last 12 months
+  drawdown_trigger: 0.20       # portfolio 20% below its peak ...
+  drawdown_growth_cap: 0.50    # ... caps growth at 50% until it is back at the peak
+  turnover_cap: 0.50           # at most 50% of the portfolio traded in any 12 months
+  liquidity: {adv_share: 0.10, days: 3}   # order-level: exitable in 3 days at 10% of volume
+
+# ===========================================================================
+# MONTE CARLO — certainty test and the 2031 range
+# ===========================================================================
+monte_carlo:
+  paths: 10000
+  seed: 2026                   # same seed = same answer every run
+  start: 2027-01-01            # Laura's first contribution
+  certainty_threshold: 0.95    # "high degree of certainty"
+  thresholds_to_compare: [0.90, 0.95, 0.99]
+  # A path SUCCEEDS if, on the carve-out date, the portfolio covers the whole
+  # reserve AND buying the part of the ladder not already owned does not
+  # require selling growth assets while they are this far below their peak.
+  forced_sale_drawdown: 0.10
+  quote:
+    date: 2031-01-01           # when Laura quotes co-sponsors
+    floor_percentile: 20
+    ceiling_percentile: 70
+  growth_returns:
+    model: bootstrap           # bootstrap (real history) | lognormal (bell curve)
+    series: VTI                # monthly total returns, dividends included, from daily prices
+    history_start: 2001-06-15
+    cache_subdir: prices_long
+    block_months: 12           # replay 12-month runs of history so crashes stay crashes
+    median_annual_return: 0.07 # history re-centred so the typical year is +7%
+    lognormal_vol: 0.16        # only for model: lognormal
+  rates:                       # one Treasury yield for all maturities, drifting randomly
+    start: from_curve          # today's 10-year Fed zero rate, or a number like 0.045
+    start_maturity_years: 10
+    long_run: 0.045
+    pull_per_year: 0.15        # how quickly rates drift back toward the long-run level
+    vol_per_year: 0.010        # typical yearly move of 1 percentage point
+    floor: 0.0
+  # Policies compared in the certainty menu. Each changes settings (dotted names
+  # from the top of this file), and each is run at every risk dial below
+  # (it replaces wind_down.risk_dial: 1.0 = as designed, 0 = no growth assets).
+  # The live settings are simulated separately, as they are in this file.
+  policies:
+    - {code: F, name: "Full hedge ramp (100% by 2032)", changes: {wind_down.hedge_ramp: [{from: 2030-01-01, share: 0.33}, {from: 2031-01-01, share: 0.67}, {from: 2032-01-01, share: 1.0}]}}
+    - {code: S, name: "Softened ramp (75% by 2032)",    changes: {wind_down.hedge_ramp: [{from: 2030-01-01, share: 0.25}, {from: 2031-01-01, share: 0.45}, {from: 2032-01-01, share: 0.75}]}}
+    - {code: L, name: "Lock in the reserve from day one", changes: {wind_down.hedge_ramp: [{from: 2026-01-01, share: 1.0}]}}
+    - {code: N, name: "No hedge ramp",                  changes: {wind_down.hedge_ramp: []}}
+  risk_dials: [1.0, 0.75, 0.5, 0.25, 0.0]
+
+# ===========================================================================
+# BACKTEST — Laura's plan replayed through real history
+# ===========================================================================
+backtest:
+  # Stocks: an S&P 500 index fund, total return from its daily prices
+  # (dividends added back). An index has no survivor bias.
+  series: VFINX
+  history_start: 1980-01-01
+  cache_subdir: prices_backtest
+  # Cash earns the 3-month Treasury rate from the Fed curve on the first of
+  # each month (FRED blocks automated downloads without an API key).
+  bill_maturity_years: 0.25
+  # Treasury ladder: the Fed zero-coupon curve on each date. It is reliable
+  # out to about 20 years from 1981, so the first window starts then.
+  first_start: 1981-01-01
+  # Quote check: in each window, the 2031-style quote is made from what was
+  # known at the time, then compared with what actually happened.
+  calibration:
+    paths_per_window: 1000
+    growth_model: lognormal    # assumptions only, no later history (no look-ahead)
+  # Backtest 2: Position Clock entry timing vs buying all at once, on index ETFs
+  # (no survivor bias). Decision each trading day; signals from the day before.
+  clock:
+    series: [SPY, QQQ, IWM, EFA, EEM]
+    horizons_days: [63, 252]           # judge each entry 3 and 12 months after the decision
+    naive_spacing_weeks: 3             # the "plain thirds" comparison
+  # Backtest 3: do the Range Table's rules predict smaller losses? Sector ETFs
+  # (no survivor bias) plus the starter stocks for the correlation question.
+  range:
+    sector_etfs: [XLB, XLE, XLF, XLI, XLK, XLP, XLU, XLV, XLY]
+    random_portfolios: 400             # random mixes of the sector ETFs, each month
+    dirichlet_alpha: 0.6               # lower = more lopsided random mixes
+    weight_bins: [0.20, 0.40]          # biggest sector <=20% (within the cap), 20-40%, >40%
+    forward_days: 252                  # judge each month by the following 12 months
+    seed: 11
+  # Backtest 4: do higher Convergence scores come before better returns?
+  # BIASED (see the report): free prices mostly lack companies that were later
+  # taken over or delisted. The stock list itself is chosen point-in-time.
+  convergence:
+    universe_year: 2013                # the biggest US companies by revenue that year...
+    universe_size: 150                 # ...this many, after removing financials
+    candidates: 260                    # how many to look at before removing financials
+    revenue_tags: [Revenues, SalesRevenueNet, SalesRevenueGoodsNet]
+    # Only companies with publicly held shares: more than this many common
+    # shares on their cover page early the next year. Removes wholly owned
+    # subsidiaries that file only because of their bonds, and companies that
+    # didn't exist yet (their year's revenue appears only in later restatements).
+    shares_url: "https://data.sec.gov/api/xbrl/frames/dei/EntityCommonStockSharesOutstanding/shares/CY{year}Q1I.json"
+    min_shares: 1000000
+    company_list_url: "https://www.sec.gov/files/company_tickers.json"
+    frames_url: "https://data.sec.gov/api/xbrl/frames/us-gaap/{tag}/USD/CY{year}.json"
+    submissions_url: "https://data.sec.gov/submissions/CIK{cik:010d}.json"
+    rebalance: {month: 4, day: 1}      # each April 1, after the annual reports are out
+    first_year: 2015                   # first year with 5+ years of tagged filings
+    last_year: 2025
+    forward_days: 365                  # judge each score by the next 12 months' total return
+    groups: 3                          # thirds: top, middle, bottom
+    # SIC industry code ranges -> sector (first match wins). An approximation
+    # of the GICS sectors used elsewhere; SIC is the SEC's own classification.
+    sic_sectors:
+      - [1311, 1389, Energy]
+      - [2900, 2999, Energy]
+      - [4610, 4619, Energy]
+      - [2830, 2836, Health Care]
+      - [3841, 3851, Health Care]
+      - [5047, 5047, Health Care]
+      - [5122, 5122, Health Care]
+      - [6324, 6324, Health Care]
+      - [8000, 8099, Health Care]
+      - [6500, 6553, Real Estate]
+      - [6798, 6798, Real Estate]
+      - [6000, 6799, Financials]
+      - [3570, 3579, Information Technology]
+      - [3660, 3699, Information Technology]
+      - [3820, 3829, Information Technology]
+      - [5045, 5045, Information Technology]
+      - [7370, 7379, Information Technology]
+      - [2710, 2799, Communication Services]
+      - [4800, 4899, Communication Services]
+      - [7810, 7819, Communication Services]
+      - [4900, 4999, Utilities]
+      - [100, 999, Consumer Staples]
+      - [2000, 2199, Consumer Staples]
+      - [2840, 2844, Consumer Staples]
+      - [5140, 5149, Consumer Staples]
+      - [5400, 5499, Consumer Staples]
+      - [5912, 5912, Consumer Staples]
+      - [2200, 2399, Consumer Discretionary]
+      - [3630, 3639, Consumer Discretionary]
+      - [3710, 3716, Consumer Discretionary]
+      - [3940, 3949, Consumer Discretionary]
+      - [5200, 5999, Consumer Discretionary]
+      - [7000, 7099, Consumer Discretionary]
+      - [1000, 1499, Materials]
+      - [2400, 2699, Materials]
+      - [2800, 2899, Materials]
+      - [3000, 3399, Materials]
+      - [1500, 1799, Industrials]
+      - [3400, 3999, Industrials]
+      - [4000, 4799, Industrials]
+      - [5000, 5199, Industrials]
+      - [7000, 8999, Industrials]

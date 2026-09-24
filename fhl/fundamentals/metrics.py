@@ -138,25 +138,36 @@ def dividend_streak(dividends: list[tuple[date, float]], as_of: date) -> int:
     return streak
 
 
-def dcf_value(fcf0: float, growth: float, discount: float, years: int, terminal: float) -> float:
-    """Value today of FCF that grows at `growth` for `years`, then at
+def growth_path(growth: float, years: int, terminal: float, fade_years: int = 0) -> list[float]:
+    """Growth rate for each forecast year: `growth` for `years`, then stepping
+    down in equal steps toward `terminal` over `fade_years` (the fade), after
+    which the terminal rate applies forever."""
+    fade = [growth + (terminal - growth) * i / (fade_years + 1) for i in range(1, fade_years + 1)]
+    return [growth] * years + fade
+
+
+def dcf_value(fcf0: float, growth: float, discount: float, years: int, terminal: float,
+              fade_years: int = 0) -> float:
+    """Value today of free cash flow that grows along growth_path(), then at
     `terminal` forever, discounted at `discount`."""
     if discount <= terminal:
         raise ValueError("discount rate must exceed terminal growth")
     pv, cash = 0.0, fcf0
-    for t in range(1, years + 1):
-        cash *= 1 + growth
+    path = growth_path(growth, years, terminal, fade_years)
+    for t, g in enumerate(path, start=1):
+        cash *= 1 + g
         pv += cash / (1 + discount) ** t
     tv = cash * (1 + terminal) / (discount - terminal)
-    return pv + tv / (1 + discount) ** years
+    return pv + tv / (1 + discount) ** len(path)
 
 
 def implied_growth(ev: float, fcf0: float, discount: float, years: int, terminal: float,
-                   lo: float, hi: float) -> float | None:
-    """Reverse DCF: the growth rate the current price is betting on."""
+                   lo: float, hi: float, fade_years: int = 0) -> float | None:
+    """Reverse DCF: the growth rate the current price is betting on, using the
+    same forecast shape (years + fade) as the forward DCF."""
     if fcf0 <= 0 or ev <= 0:
         return None
-    f = lambda g: dcf_value(fcf0, g, discount, years, terminal) - ev
+    f = lambda g: dcf_value(fcf0, g, discount, years, terminal, fade_years) - ev
     if f(lo) > 0:
         return lo      # even shrinking at `lo` is worth more than the price
     if f(hi) < 0:

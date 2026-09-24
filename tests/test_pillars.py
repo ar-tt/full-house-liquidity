@@ -36,9 +36,9 @@ def buy(ticker="FIN0", amount=5_000):
 PF = Portfolio(dict(BASE), 250_000)
 
 
-def test_default_config_loads_range_then_convergence(cfg):
+def test_default_config_loads_all_three_pillars(cfg):
     pillars = load_pillars(cfg, ctx_for(cfg))
-    assert [p.name for p in pillars] == ["range", "convergence"]
+    assert [p.name for p in pillars] == ["range", "convergence", "position"]
     assert pillars[0].structural and pillars[0].weight == 50
     assert cfg["combine"]["method"] == "gate_then_weighted"
 
@@ -52,12 +52,12 @@ def test_a_new_pillar_is_one_config_line(cfg):
 def test_structural_pillars_run_first_whatever_the_config_order(cfg):
     c = copy.deepcopy(cfg)
     c["pillars"] = [{"name": "edge", "module": DUMMY, "weight": 25, "fixed_score": 80}] + c["pillars"]
-    assert [p.name for p in load_pillars(c, ctx_for(c))] == ["range", "edge", "convergence"]
+    assert [p.name for p in load_pillars(c, ctx_for(c))] == ["range", "edge", "convergence", "position"]
 
 
 def test_disabled_pillar_file_need_not_exist(cfg):
-    assert not next(p for p in cfg["pillars"] if p["name"] == "position")["enabled"]
-    load_pillars(cfg, ctx_for(cfg))  # position_clock.py doesn't exist yet: no error
+    c = with_pillars(cfg, {"name": "edge", "module": "fhl.pillars.edge:Edge", "weight": 25, "enabled": False})
+    assert [p.name for p in load_pillars(c, ctx_for(c))] == ["range"]   # edge.py doesn't exist: no error
 
 
 @pytest.mark.parametrize("module, message", [

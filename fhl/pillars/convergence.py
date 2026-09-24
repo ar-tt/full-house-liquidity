@@ -29,6 +29,7 @@ from datetime import date, timedelta
 
 from ..fundamentals import metrics as M
 from ..prices import close_on_or_after, split_factor_after, weekly_total_returns
+from ..config import ConfigError
 from .base import BLOCK, INFO, WARN, Pillar, PillarResult, Rule
 from .range_table import lin
 
@@ -81,12 +82,18 @@ class ConvergenceEngine(Pillar):
         except LookupError:
             return []
 
+    def _splits(self, ticker):
+        try:
+            return self.ctx.prices.split_events(ticker)
+        except LookupError:
+            return []
+
     def _market_value(self, sec, fin, bars):
         """(price, shares on today's basis, market cap) or None."""
         if not bars or not fin.latest_shares:
             return None
         filed, shares = fin.latest_shares
-        shares *= split_factor_after(self.ctx.prices.split_events(sec.ticker), filed)
+        shares *= split_factor_after(self._splits(sec.ticker), filed)
         price = bars[-1].close
         return price, shares, price * shares
 
@@ -153,13 +160,17 @@ class ConvergenceEngine(Pillar):
         if fin is None or len(fin.years) < c["min_years"]:
             n = 0 if fin is None else len(fin.years)
             return Analysis(ticker, MISSING, f"only {n} years of filings (need {c['min_years']})")
+        age = (self.ctx.as_of - fin.years[-1].end).days
+        if age > c["max_report_age_days"]:
+            return Analysis(ticker, MISSING, f"latest annual report is for {fin.years[-1].end}, {age} days old "
+                            "(merged, reorganized under a new SEC number, or stopped filing)")
 
         a = Analysis(ticker, SCORED)
         hist = fin.years[-c["history_years"]:]
         last = hist[-1]
         k = c["dcf"]["fcf_average_years"]
         bars = self._bars(ticker)
-        splits = self.ctx.prices.split_events(ticker)
+        splits = self._splits(ticker)
 
         def on_todays_basis(fy, concept):
             """Share counts and per-share figures restated for every split after
@@ -248,20 +259,21 @@ class ConvergenceEngine(Pillar):
         else:
             price, shares, mcap = mv
             ev = mcap + (nd or 0.0)
-            fcfs = [M.fcf(fy) for fy in hist[-k:] if M.fcf(fy) is not None]
-            fcf0 = sum(fcfs) / len(fcfs) if fcfs else None
+            if dc["fcf_start"] == "latest":
+                fcf0 = M.fcf(last)
+            else:
+                fcfs = [M.fcf(fy) for fy in hist[-k:] if M.fcf(fy) is not None]
+                fcf0 = sum(fcfs) / len(fcfs) if fcfs else None
             a.facts.update(price=price, market_cap=mcap, enterprise_value=ev, fcf_start=fcf0)
+            estimates = {}   # method -> value of the whole company's shares, in dollars
             if fcf0 and fcf0 > 0 and rev_g is not None:
                 terminal = min(dc["terminal_growth"], wacc - 0.01)
                 g_used = min(max(rev_g, dc["growth_bounds"][0]), dc["growth_bounds"][1])
-                iv_equity = M.dcf_value(fcf0, g_used, wacc, dc["years"], terminal) - (nd or 0.0)
-                mos = 1 - mcap / iv_equity if iv_equity > 0 else -1.0
-                a.facts.update(dcf_growth_used=g_used, intrinsic_value_per_share=iv_equity / shares,
-                               margin_of_safety=mos)
-                v["margin_of_safety"] = self._score(
-                    "value", "margin_of_safety", mos,
-                    f"{mos:+.0%} (value ${iv_equity / shares:,.2f} vs price ${price:,.2f})")
-                implied = M.implied_growth(ev, fcf0, wacc, dc["years"], terminal, *dc["reverse_search"])
+                estimates["dcf"] = M.dcf_value(fcf0, g_used, wacc, dc["years"], terminal,
+                                               dc["fade_years"]) - (nd or 0.0)
+                a.facts["dcf_growth_used"] = g_used
+                implied = M.implied_growth(ev, fcf0, wacc, dc["years"], terminal, *dc["reverse_search"],
+                                           fade_years=dc["fade_years"])
                 if implied is not None:
                     gap = rev_g - implied
                     a.facts.update(implied_growth=implied, delivered_growth=rev_g)
@@ -290,6 +302,8 @@ class ConvergenceEngine(Pillar):
                 if pos is not None:
                     v["fcf_yield_vs_own"] = self._score("value", "fcf_yield_vs_own", pos,
                                                         f"FCF yield {y_now:.1%}, {pos:.0%} of the way to its 10-yr high")
+                    if now_fcf > 0 and statistics.median(fy_hist) > 0:
+                        estimates["own_fcf_yield"] = now_fcf / statistics.median(fy_hist)
             if now_ebit and now_ebit > 0 and ev_hist:
                 m_now = ev / now_ebit
                 a.facts["ev_ebit"] = m_now
@@ -297,6 +311,7 @@ class ConvergenceEngine(Pillar):
                 if pos is not None:
                     v["ev_ebit_vs_own"] = self._score("value", "ev_ebit_vs_own", pos,
                                                       f"EV/EBIT {m_now:.1f}x, {pos:.0%} of the way to its 10-yr high")
+                    estimates["own_ev_ebit"] = statistics.median(ev_hist) * now_ebit - (nd or 0.0)
                 peers = [p for p in (self._peer_ev_ebit(t) for t, s in self.ctx.securities.items()
                                      if t != ticker and s.type == "stock" and s.main_sector == sec.main_sector)
                          if p is not None]
@@ -304,6 +319,33 @@ class ConvergenceEngine(Pillar):
                     ratio = m_now / statistics.median(peers)
                     v["ev_ebit_vs_sector"] = self._score("value", "ev_ebit_vs_sector", ratio,
                                                          f"{ratio:.2f}x the sector median of {len(peers)} peers")
+                    estimates["sector_ev_ebit"] = statistics.median(peers) * now_ebit - (nd or 0.0)
+
+            # ---- margin of safety, on the basis chosen in config
+            val = c["valuation"]
+            mos_of = lambda equity: 1 - mcap / equity if equity > 0 else -1.0
+            a.facts["value_per_share"] = {k: e / shares for k, e in estimates.items()}
+            if "dcf" in estimates:
+                a.facts["mos_dcf"] = mos_of(estimates["dcf"])
+            w = {k: val["blend_weights"][k] for k in estimates if val["blend_weights"].get(k, 0) > 0}
+            if len(w) >= val["blend_min_methods"]:
+                blended = sum(w[k] * estimates[k] for k in w) / sum(w.values())
+                a.facts["value_per_share"]["blended"] = blended / shares
+                a.facts["mos_blended"] = mos_of(blended)
+            basis = val["margin_of_safety_basis"]
+            if basis not in ("dcf", "blended"):
+                raise ConfigError(f"convergence.valuation.margin_of_safety_basis must be dcf or blended, got '{basis}'")
+            mos = a.facts.get(f"mos_{basis}")
+            if mos is None:
+                if basis == "blended":
+                    a.notes.append(f"no blended value: only {len(w)} valuation method(s) available "
+                                   f"(need {val['blend_min_methods']})")
+            else:
+                vps = a.facts["value_per_share"][basis]
+                a.facts.update(margin_of_safety=mos, intrinsic_value_per_share=vps, margin_of_safety_basis=basis)
+                v = {"margin_of_safety": self._score(
+                    "value", "margin_of_safety", mos,
+                    f"{mos:+.0%} ({basis} value ${vps:,.2f} vs price ${price:,.2f})"), **v}
         a.metrics["value"] = v
 
         # ---------------- COMBINE
@@ -365,7 +407,8 @@ class ConvergenceEngine(Pillar):
         mos = a.facts.get("margin_of_safety")
         need = h["min_margin_of_safety"]
         if mos is None:
-            why = next((n for n in a.notes if n.startswith(("value not", "no DCF"))), "value not computed")
+            why = next((n for n in a.notes if n.startswith(("value not", "no blended", "no DCF"))),
+                       "value not computed")
             sev = BLOCK if buy and h["margin_of_safety_unknown"] == "block" else WARN
             rules.append(Rule("margin_of_safety", False, f"can't verify the {need:.0%} margin of safety: {why}", sev))
         elif mos < need:
@@ -402,3 +445,11 @@ def format_analysis(a: Analysis, explain: bool = False) -> list[str]:
         for n in a.notes:
             out.append(f"Note: {n}")
     return out
+
+
+def what_if(cfg: dict, changes: dict) -> dict:
+    """A copy of the config with some Convergence settings changed. Keys are
+    dotted names under `convergence`, e.g. {"dcf.fade_years": 10}. Unknown
+    names are refused, so a typo can't silently do nothing."""
+    from ..config import with_changes
+    return with_changes(cfg, changes, prefix="convergence")

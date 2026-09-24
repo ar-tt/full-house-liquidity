@@ -54,6 +54,10 @@ def decide(proposal: Proposal, portfolio: Portfolio, pillars: list[Pillar], cfg:
                             not_run=[p.name for p in pillars[i + 1:]])
     scored = [(p, r.score) for p, r in zip(pillars, results) if r.score is not None]
     score = combine_scores(scored, cfg["combine"]["method"])
+    waits = [(r.pillar, rule) for r in results for rule in r.fired if rule.severity == "wait"]
+    if waits:
+        pillar, rule = waits[0]
+        return Decision(proposal, HOLD, score, f"{pillar}: {rule.message}", results)
     if proposal.action == "sell":
         return Decision(proposal, ACT, score, "sells are not held back by score", results)
     threshold = cfg["combine"]["min_score_to_act"]

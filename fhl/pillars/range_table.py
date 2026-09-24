@@ -33,6 +33,19 @@ from .base import BLOCK, INFO, WARN, Pillar, PillarResult, Rule
 EPS = 1e-9
 
 
+def asset_class_budgets(cfg: dict, as_of) -> dict:
+    """Asset-class [min, max] budgets for a date. With equity_max_from_wind_down
+    on, each growth asset class's max is the wind-down ceiling for that date."""
+    from ..wind_down import band_on
+    rt = cfg["range_table"]
+    out = {k: list(v) for k, v in rt["asset_class_budgets"].items()}
+    if rt.get("equity_max_from_wind_down"):
+        ceiling = band_on(cfg, as_of)[1]
+        for ac in cfg["wind_down"]["growth_asset_classes"]:
+            out[ac][1] = ceiling
+    return out
+
+
 def lin(x: float, best: float, worst: float) -> float:
     """100 at `best`, 0 at `worst`, straight line between, clamped."""
     if best == worst:
@@ -66,6 +79,7 @@ class RangeTable(Pillar):
             missing = set(self.rt[names]) - set(self.rt[key])
             if missing:
                 raise ConfigError(f"range_table.{key} has no budget for {sorted(missing)}")
+        self.ac_budgets = asset_class_budgets(ctx.cfg, ctx.as_of)
 
     # ------------------------------------------------------------------ caps
     def cap_usages(self, pf: Portfolio) -> list[tuple[str, float, float]]:
@@ -91,7 +105,7 @@ class RangeTable(Pillar):
         for region, x in regions.items():
             out.append((f"region {region}", x, rt["region_budgets"][region][1]))
         for ac, x in exposures(pf, secs, "asset_class").items():
-            out.append((f"asset class {ac}", x, rt["asset_class_budgets"][ac][1]))
+            out.append((f"asset class {ac}", x, self.ac_budgets[ac][1]))
         return [u for u in out if u[2] < 1]
 
     # ------------------------------------------------------- correlation
@@ -201,10 +215,10 @@ class RangeTable(Pillar):
 
         # 4. asset class budget
         ab, aa = exposures(pf, secs, "asset_class"), exposures(after, secs, "asset_class")
-        lo, hi = rt["asset_class_budgets"][s.asset_class]
+        lo, hi = self.ac_budgets[s.asset_class]
         cap_rule("asset_class_budget", f"asset class {s.asset_class}",
                  ab.get(s.asset_class, 0), aa.get(s.asset_class, 0), hi)
-        for ac, (lo, _) in rt["asset_class_budgets"].items():
+        for ac, (lo, _) in self.ac_budgets.items():
             if aa.get(ac, 0) < lo - EPS:
                 rules.append(Rule("asset_class_min", False, f"asset class {ac} {aa.get(ac, 0):.1%} is "
                                   f"under its {lo:.0%} minimum", WARN, aa.get(ac, 0), lo))

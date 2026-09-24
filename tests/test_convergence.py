@@ -48,9 +48,16 @@ def facts():
     }
 
 
+DCF_ONLY = {"valuation.margin_of_safety_basis": "dcf"}
+
+
 def engine(cfg, level=50.0, changes=None, levels=None):
+    """Most tests measure the margin of safety on the DCF alone: in these fake
+    price histories the price never changes level, so the own-history values
+    would move with the price and hide what is being tested. The blend tests
+    ask for it explicitly."""
     c = copy.deepcopy(cfg)
-    for path, value in (changes or {}).items():
+    for path, value in {**DCF_ONLY, **(changes or {})}.items():
         node = c["convergence"]
         *head, last = path.split(".")
         for k in head:
@@ -203,3 +210,110 @@ def test_uses_only_reports_public_by_the_as_of_date(cfg):
     eng = engine(cfg)
     eng.ctx.as_of = date(2026, 2, 14)                  # the day before the 2025 report
     assert eng.analyze("GOOD").facts["latest_year"] == "2024-12-31"
+
+
+# --- DCF settings --------------------------------------------------------------------
+
+def test_fade_raises_value_for_a_business_growing_faster_than_terminal(cfg):
+    plain = engine(cfg, changes={"dcf.fade_years": 0}).analyze("GOOD").facts["intrinsic_value_per_share"]
+    faded = engine(cfg, changes={"dcf.fade_years": 10}).analyze("GOOD").facts["intrinsic_value_per_share"]
+    assert faded > plain
+
+
+def test_fcf_start_latest_uses_last_years_cash_flow(cfg):
+    a = engine(cfg, changes={"dcf.fcf_start": "latest"}).analyze("GOOD")
+    last = compounder()[-1]
+    assert a.facts["fcf_start"] == pytest.approx(last["operating_cash_flow"] - last["capex"])
+    avg = engine(cfg).analyze("GOOD").facts["fcf_start"]
+    assert avg < a.facts["fcf_start"]                   # a growing business: average lags
+
+
+def test_what_if_refuses_unknown_settings(cfg):
+    from fhl.config import ConfigError
+    from fhl.pillars.convergence import what_if
+    for bad in ("dcf.fade_yeers", "valuaton.margin_of_safety_basis", "dcf.fade_years.deeper"):
+        with pytest.raises(ConfigError, match="unknown setting"):
+            what_if(cfg, {bad: 10})
+    before = copy.deepcopy(cfg["convergence"])
+    changed = what_if(cfg, {"dcf.fade_years": 3, "valuation.margin_of_safety_basis": "dcf"})
+    assert changed["convergence"]["dcf"]["fade_years"] == 3
+    assert changed["convergence"]["valuation"]["margin_of_safety_basis"] == "dcf"
+    assert cfg["convergence"] == before                           # original untouched
+
+
+def test_every_configured_variant_is_valid(cfg):
+    from fhl.pillars.convergence import what_if
+    codes = [v["code"] for v in cfg["convergence"]["valuation_variants"]]
+    assert len(codes) == len(set(codes))
+    for v in cfg["convergence"]["valuation_variants"]:
+        what_if(cfg, v["changes"])
+
+
+# --- option 3: margin of safety against a blended value ----------------------------
+
+BLEND = {"valuation.margin_of_safety_basis": "blended"}
+
+
+def test_blended_value_is_the_weighted_mix_of_every_method(cfg):
+    a = engine(cfg, changes=BLEND).analyze("GOOD")
+    vps = a.facts["value_per_share"]
+    w = cfg["convergence"]["valuation"]["blend_weights"]
+    methods = ["dcf", "own_ev_ebit", "own_fcf_yield", "sector_ev_ebit"]
+    assert set(methods) <= set(vps)
+    expected = sum(w[m] * vps[m] for m in methods) / sum(w[m] for m in methods)
+    assert vps["blended"] == pytest.approx(expected)
+    assert a.facts["margin_of_safety_basis"] == "blended"
+    assert a.facts["margin_of_safety"] == pytest.approx(a.facts["mos_blended"])
+    assert a.facts["margin_of_safety"] == pytest.approx(1 - a.facts["price"] / vps["blended"], abs=0.02)
+
+
+def test_default_is_3c_blend_with_fade_10_dcf(cfg):
+    assert cfg["convergence"]["valuation"]["margin_of_safety_basis"] == "blended"
+    assert cfg["convergence"]["dcf"]["fade_years"] == 10
+    three_c = next(v for v in cfg["convergence"]["valuation_variants"] if v["code"] == "3C")
+    from fhl.pillars.convergence import what_if
+    assert what_if(cfg, three_c["changes"])["convergence"] == cfg["convergence"]
+
+
+def test_dcf_basis_is_unchanged_by_the_blend_settings(cfg):
+    a = engine(cfg).analyze("GOOD")
+    assert a.facts["margin_of_safety_basis"] == "dcf"
+    assert a.facts["margin_of_safety"] == pytest.approx(a.facts["mos_dcf"])
+    assert "mos_blended" in a.facts            # still computed, so it can be compared
+
+
+def test_blend_can_value_a_company_without_free_cash_flow(cfg):
+    a = engine(cfg, changes=BLEND).analyze("LOSSCO")
+    vps = a.facts["value_per_share"]
+    assert "dcf" not in vps and "own_fcf_yield" not in vps
+    assert {"own_ev_ebit", "sector_ev_ebit", "blended"} <= set(vps)
+    assert "can't verify" not in " ".join(r.message for r in run(engine(cfg, changes=BLEND), "LOSSCO").rules)
+
+
+def test_too_few_methods_means_no_blended_value(cfg):
+    res = run(engine(cfg, changes={**BLEND, "valuation.blend_min_methods": 5}), "GOOD")
+    assert blocks(res) == ["margin_of_safety"]
+    assert "no blended value" in res.fired[0].message
+
+
+def test_unknown_basis_is_refused(cfg):
+    from fhl.config import ConfigError
+    with pytest.raises(ConfigError, match="margin_of_safety_basis"):
+        engine(cfg, changes={"valuation.margin_of_safety_basis": "vibes"}).analyze("GOOD")
+
+
+# --- robustness found by backtest 4 ---------------------------------------------
+
+def test_stale_filings_are_not_scored(cfg):
+    eng = engine(cfg)
+    eng.ctx.as_of = date(2029, 6, 1)             # the latest report (2025) is now years old
+    a = eng.analyze("GOOD")
+    assert a.status == MISSING and "days old" in a.reason
+
+
+def test_a_stock_without_prices_does_not_crash_the_engine(cfg):
+    eng = engine(cfg)
+    del eng.ctx.prices.data["GOOD"]               # filings but no price history at all
+    a = eng.analyze("GOOD")
+    assert a.status in (SCORED, MISSING)
+    assert a.facts.get("margin_of_safety") is None

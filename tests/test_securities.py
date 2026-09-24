@@ -46,3 +46,15 @@ def test_bad_labels_rejected(cfg, tmp_path, field, value, message):
 def test_held_but_unlisted_ticker_is_an_error(cfg):
     with pytest.raises(ConfigError, match="missing from securities.yaml"):
         Portfolio({"ZZZZ": 1.0}).tickers(load_securities(cfg))
+
+
+def test_local_config_overrides_without_touching_the_rest(tmp_path):
+    from fhl.config import DEFAULT_PATH, load_config
+    main = tmp_path / "config.yaml"
+    main.write_text(DEFAULT_PATH.read_text())
+    (tmp_path / "config.local.yaml").write_text('fundamentals:\n  user_agent: "private"\n')
+    cfg = load_config(main)
+    assert cfg["fundamentals"]["user_agent"] == "private"
+    assert cfg["fundamentals"]["edgar_url"].startswith("https://data.sec.gov")   # siblings kept
+    (tmp_path / "config.local.yaml").unlink()
+    assert "[add contact email" in load_config(main)["fundamentals"]["user_agent"]

@@ -1,6 +1,7 @@
 # EXAMPLE PORTFOLIO — made up to exercise the Range Table rules
 # (roughly the size of Laura's account in 2028). Not a recommendation.
 # Values are current market values in dollars.
+contributions_through: 2028-01-01   # both of Laura's contributions are already in these values
 holdings:
   AAPL: 18000
   MSFT: 18000
@@ -18,8 +19,14 @@ holdings:
   AMT: 18000
   TSM: 18000
   ASML: 18000
-  NVO: 18000
+  NVO: 6000       # first of three tranches (see entries below)
   VTI: 60000
   VEA: 40000
   GOVT: 30000
-cash: 35000
+cash: 47000
+
+# Positions still being bought in tranches (the Position Clock reads this).
+# started: first tranche date; tranches_done: how many of the 3 are in;
+# full_size: the whole position in dollars, fixed on the first tranche.
+entries:
+  NVO: {started: 2026-09-08, tranches_done: 1, full_size: 18000}

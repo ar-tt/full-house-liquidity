@@ -18,7 +18,7 @@ from ..config import ConfigError
 from ..portfolio import Portfolio, Proposal
 from ..prices import PriceSource
 
-BLOCK, WARN, INFO = "block", "warn", "info"
+BLOCK, WAIT, WARN, INFO = "block", "wait", "warn", "info"   # wait = "not yet": the order is held, not refused
 
 
 @dataclass
@@ -26,7 +26,7 @@ class Rule:
     code: str              # short id, e.g. "sector_cap"
     passed: bool
     message: str           # plain English, shown by --explain and in the decision log
-    severity: str = INFO   # block | warn | info (what happens if it fails)
+    severity: str = INFO   # block | wait | warn | info (what happens if it fails)
     value: float | None = None
     limit: float | None = None
 
@@ -45,6 +45,10 @@ class PillarResult:
     @property
     def blocked(self) -> bool:
         return any(r.fired and r.severity == BLOCK for r in self.rules)
+
+    @property
+    def waiting(self) -> bool:
+        return any(r.fired and r.severity == WAIT for r in self.rules)
 
     @property
     def fired(self) -> list[Rule]:
